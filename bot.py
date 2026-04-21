@@ -214,12 +214,12 @@ def main():
             break
         except Exception as e:
             log = get_logger()
-        err_str = str(e)
-        log.error(f"LOOP_ERROR: {err_str}")
-        print(f"loop error: {err_str}")
-        # Send critical errors to Telegram (throttle ErrCode 10024 - known testnet restriction)
-        if "10024" not in err_str:
-            notifier.send(f"⚠️ LOOP ERROR: {err_str[:200]}")
+            err_str = str(e)
+            log.error(f"LOOP_ERROR: {err_str}")
+            print(f"loop error: {err_str}")
+            # Send to Telegram - suppress noisy ErrCode 10024 (testnet geo-restriction)
+            if "10024" not in err_str:
+                notifier.send(f"⚠️ LOOP ERROR: {err_str[:200]}")
             time.sleep(30)
 
 if __name__ == "__main__":
