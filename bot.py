@@ -168,11 +168,17 @@ def main():
                                 tn_tp = round(tn_px * (1 - tp_pct), 2)
                             order_kwargs["stopLoss"] = str(tn_sl)
                             order_kwargs["takeProfit"] = str(tn_tp)
-                        except Exception:
-                            pass  # no SL/TP on testnet if price fetch fails
+                        except Exception as sl_err:
+                                log.warning(f"[WARN] Testnet SL/TP price fetch failed, order placed without SL/TP: {sl_err}")
                 else:
                     order_kwargs["stopLoss"] = str(round(signal.sl_price, 2))
                     order_kwargs["takeProfit"] = str(round(signal.tp_price, 2))
+                # Hard p_win floor: skip trade if meta-labeler is active and p_win < 0.35
+                if signal.meta_p_win is not None and signal.meta_p_win < 0.35:
+                    skip_msg = f"[SKIP] p_win={signal.meta_p_win:.2f} below floor 0.35 — trade blocked"
+                    log.warning(skip_msg)
+                    notifier.send(skip_msg)
+                    continue
                 order = client.place_order(**order_kwargs)
                 pending_meta_signal_id = signal.meta_signal_id
                 pwin_str = f" p_win={signal.meta_p_win:.2f}" if signal.meta_p_win is not None else ""

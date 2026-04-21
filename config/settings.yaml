@@ -6,7 +6,7 @@ risk:
   consecutive_loss_circuit_breaker: 4
   daily_loss_stop_pct: 0.03
 kelly:
-  fraction_c: 0.5
+  fraction_c: 0.25
   fmax: 0.08
   prior_mu: 0.002
   prior_sigma2: 0.0004
@@ -46,7 +46,7 @@ regimes:
     tp_atr_mult: 2.0
   BULL:
     action: TREND_LONG
-    sl_atr_mult: 2.5
+    sl_atr_mult: 1.8
     tp_atr_mult: 5.0
 ofi:
   enabled: true
@@ -95,3 +95,4 @@ hedging:
     enabled: false
     monthly_premium_pct: 0.01
     strike_otm_pct: 0.1
+consecutive_loss_circuit_breaker: 3
