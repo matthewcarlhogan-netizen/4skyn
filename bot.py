@@ -215,7 +215,11 @@ def main():
         except Exception as e:
             log = get_logger()
             log.error(f"LOOP_ERROR {type(e).__name__}: {e}")
-            print(f"loop error: {e}")
+        err_str = str(e)
+        print(f"loop error: {err_str}")
+        # Send critical errors to Telegram (throttle ErrCode 10024 - known testnet restriction)
+        if "10024" not in err_str:
+            notifier.send(f"⚠️ LOOP ERROR: {err_str[:200]}")
             time.sleep(30)
 
 if __name__ == "__main__":
