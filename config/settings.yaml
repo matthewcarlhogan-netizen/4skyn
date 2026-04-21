@@ -1,137 +1,97 @@
-# OpenClaw V7 configuration
-# All tuneable parameters live here. Do not hardcode in source.
-
-capital_tier: "seed"   # seed ($250-1k) | growth ($1k-5k) | scaled ($5k+)
-
-# ── Risk ──────────────────────────────────────────────────────────────────
+capital_tier: seed
 risk:
-  max_drawdown_pct: 0.10           # hard kill-switch at 10% from HWM
-  risk_per_trade_pct: 0.005        # 0.5% of equity stopped out per trade
-  max_leverage: 3                   # constant, does NOT scale with equity
-  consecutive_loss_circuit_breaker: 4   # pause 24h after 4 losses in a row
-  daily_loss_stop_pct: 0.03        # stop trading for the day if -3% intraday
-
-# ── Kelly sizing ──────────────────────────────────────────────────────────
-# ⚠️ SEED TIER ($250-1k on ETHUSDT): fmax tuned to clear exchange min notional.
-# At $250 * 0.05 * 3x lev = $37.50 notional — above ETH min (~$20) but below BTC min ($100).
-# Once equity > $1k, DROP fmax BACK TO 0.015 for institutional-grade sizing.
+  max_drawdown_pct: 0.1
+  risk_per_trade_pct: 0.005
+  max_leverage: 3
+  consecutive_loss_circuit_breaker: 4
+  daily_loss_stop_pct: 0.03
 kelly:
-  fraction_c: 0.50                  # SEED TIER: half-Kelly (drop to 0.25 at $1k+)
-  fmax: 0.08                        # SEED TIER ONLY — drop to 0.015 at $1k+
-  # Bayesian prior so bot trades from day 1 (fixes cold-start)
-  prior_mu: 0.002                   # assumed avg log-return per trade
-  prior_sigma2: 0.0004              # assumed variance
-  prior_weight: 30                  # "pseudo-trades" — shrinks toward prior early, fades as real data grows
-  drawdown_clamp_threshold: 0.80    # halve size when equity < 80% of HWM
-
-# ── Regime model ──────────────────────────────────────────────────────────
+  fraction_c: 0.5
+  fmax: 0.08
+  prior_mu: 0.002
+  prior_sigma2: 0.0004
+  prior_weight: 30
+  drawdown_clamp_threshold: 0.8
 regime:
   n_states: 3
-  features:                         # ONLY features with real live data
-    - log_return
-    - realized_vol
-    - trend
-    - volume_zscore
-    - rviv
-    - funding_live                  # real funding rate time-series (not constant)
-    - oi_change                     # real OI delta (not zero)
-  cov_type: "diag"
-  confidence_threshold: 0.75        # raised from 0.65 — reduces trade frequency
+  features:
+  - log_return
+  - realized_vol
+  - trend
+  - volume_zscore
+  - rviv
+  - funding_live
+  - oi_change
+  cov_type: diag
+  confidence_threshold: 0.5
   training_days: 180
-  retrain_days: 14                  # 2-week cadence (was 30, too slow per 2025 research)
-  preserve_learned_transmat: true   # DO NOT override what EM learned
-  persistence_bars: 2               # 1h bars: 2 bars = 2h of regime consistency before acting
-  cooldown_bars: 3                  # min 3h between trades (3 × 1h bars)
-
-# ── Meta-labeler (secondary classifier, Lopez de Prado AFML Ch. 3) ──────
-# Stacks on top of HMM signal. Only act when P(win | signal) >= threshold.
-# Starts in pass-through mode; activates after N real trades.
+  retrain_days: 14
+  preserve_learned_transmat: true
+  persistence_bars: 1
+  cooldown_bars: 1
 meta_labeler:
   enabled: true
-  model_path: "models/meta_labeler.pkl"
-  activation_threshold: 50          # real trades before classifier gates
-  prob_threshold: 0.53              # min P(win) to take a signal (after activation)
-  training_data_path: "data/meta_training.parquet"
-  retrain_every_n_trades: 25        # retrain after every N new labelled outcomes
-  rolling_window_trades: 3000       # broader window — covers ~6 months of trades; prevents overfit on small slices
-
-# ── Strategy behaviour per regime ─────────────────────────────────────────
+  model_path: models/meta_labeler.pkl
+  activation_threshold: 20
+  prob_threshold: 0.6
+  training_data_path: data/meta_training.parquet
+  retrain_every_n_trades: 25
+  rolling_window_trades: 3000
 regimes:
   CRISIS:
     action: HOLD
   RANGE:
-    action: MEAN_REVERT             # was SELL (wrong); mean-revert around midline
+    action: MEAN_REVERT
     sl_atr_mult: 1.5
-    tp_atr_mult: 2.0                # tighter TP than BULL (2:1 not 2.5:1)
+    tp_atr_mult: 2.0
   BULL:
     action: TREND_LONG
     sl_atr_mult: 2.5
-    tp_atr_mult: 5.0                # 2:1 reward:risk
-
-# ── OFI filter ─────────────────────────────────────────────────────────────
+    tp_atr_mult: 5.0
 ofi:
   enabled: true
-  use_mainnet_orderbook: true       # was testnet (synthetic) in V6
+  use_mainnet_orderbook: true
   window: 20
-  percentile_threshold: 75
-
-# ── Execution ─────────────────────────────────────────────────────────────
+  percentile_threshold: 40
 execution:
-  symbol: "ETHUSDT"                 # seed tier: lower min notional than BTC
-  timeframe: "60"                   # 1h bars — 15m had too much noise (42% win rate, fee drag)
-  closed_bar_only: true             # drop in-progress bar (fixes lookahead)
-  min_notional_usd: 20              # Bybit ETHUSDT linear perp minimum (~$20)
-  depth_haircut: 0.03               # cap notional at 3% of top-5 book depth
-
-# ── Market data ───────────────────────────────────────────────────────────
+  symbol: BTCUSDT
+  timeframe: '15'
+  closed_bar_only: true
+  min_notional_usd: 100
+  depth_haircut: 0.03
 data:
   use_mainnet_for_prices: true
-  use_testnet_for_orders: true      # set to false once live
-
-# ── Infra ─────────────────────────────────────────────────────────────────
+  use_testnet_for_orders: true
 infra:
-  log_dir: "logs"
-  model_path: "models/hmm_btc_v7.pkl"
-  trade_log: "data/tradelog.json"
-  hwm_path: "data/highwatermark.json"
+  log_dir: logs
+  model_path: models/hmm_btc_v7.pkl
+  trade_log: data/tradelog.json
+  hwm_path: data/highwatermark.json
   loop_interval_s: 60
   telegram_heartbeat_s: 3600
-
-# ── V7.5: Cycle / Macro overlay ───────────────────────────────────────────
-# CycleDetector runs 12 Dewey cycles (9 original + K-Wave, Juglar, Kitchin).
-# macro_composite = weighted avg of K-Wave + Juglar + Kitchin only.
-# kelly_multiplier from full composite (0.3x – 1.5x) applied to every trade size.
 cycle:
-  bybit_symbol: "ETHUSDT"        # symbol used for live funding / rotation reads
-  macro_veto_threshold: -0.40    # macro_composite below this = HOLD, no trades
-
-# ── V7.5: Meme scanner ────────────────────────────────────────────────────
+  bybit_symbol: BTCUSDT
+  macro_veto_threshold: -0.9
 meme_scanner:
-  enabled: false                 # set true to run background meme scanning
-  interval_minutes: 15           # how often to scan
-  alert_threshold: 6             # base score out of 8 (adjusted by cycle sentiment)
-  lottery_budget_usd: 10.0       # max $ per meme position — lottery budget only
-  macro_veto_threshold: -0.40    # same as cycle.macro_veto_threshold
-
-# ── V7.5: AI Cycle Predictor (optional, requires torch) ───────────────────
+  enabled: false
+  interval_minutes: 15
+  alert_threshold: 6
+  lottery_budget_usd: 10.0
+  macro_veto_threshold: -0.9
 cycle_ai:
-  enabled: false                 # set true once torch is installed and model trained
-  checkpoint_path: "data/ai_cycle_predictor.pth"
-  history_cache_path: "data/cycle_history_cache.json"
-  seq_len: 60                    # days of history fed into LSTM
-  horizon: 30                    # days ahead to predict
-  # To train: python -m core.cycle_ai_predictor --years 4 --epochs 60
-  # Delete old checkpoint if upgrading from V7 (N_SIGNALS changed 9 → 12)
-
-# ── Hedging layers (disabled until capital tier unlocks) ──────────────────
+  enabled: false
+  checkpoint_path: data/ai_cycle_predictor.pth
+  history_cache_path: data/cycle_history_cache.json
+  seq_len: 60
+  horizon: 30
 hedging:
   profit_sweep:
-    enabled: false                  # enable at $500+
-    lock_pct: 0.40
+    enabled: false
+    lock_pct: 0.4
   cash_and_carry:
-    enabled: false                  # enable at $1k+
+    enabled: false
     allocation_pct: 0.25
   deribit_tail_puts:
-    enabled: false                  # enable at $5k+
+    enabled: false
     monthly_premium_pct: 0.01
-    strike_otm_pct: 0.10
+    strike_otm_pct: 0.1

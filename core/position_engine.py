@@ -247,13 +247,16 @@ class PositionEngine:
         if ofi_cfg.get("enabled", True):
             ofi_val, ofi_rank = self.ofi.compute(self.symbol)
             threshold = ofi_cfg.get("percentile_threshold", 75)
+            # If OFI has insufficient history (val==0, rank==50), treat as neutral pass-through
+            ofi_neutral = (ofi_val == 0.0 and ofi_rank == 50.0)
             aligned = (
-                (direction > 0 and ofi_rank >= threshold and ofi_val > 0)
+                ofi_neutral  # not enough history yet — don't block
+                or (direction > 0 and ofi_rank >= threshold and ofi_val > 0)
                 or (direction < 0 and ofi_rank <= (100 - threshold) and ofi_val < 0)
             )
             if not aligned:
                 return TradeSignal("HOLD", 0, None, None, regime, conf,
-                                   "OFI not aligned", price)
+                                   f"OFI not aligned rank={ofi_rank:.0f} val={ofi_val:.4f}", price)
 
         # 6. Meta-labeler gate
         meta_signal_id = None
@@ -371,26 +374,34 @@ class PositionEngine:
     def _direction_for(self, regime: str, action: str, df: pd.DataFrame) -> int:
         """
         Map regime action to directional intent.
-        All signals filtered through 200-period EMA trend gate.
-        BULL: only long when price > EMA200.
-        RANGE: mean-revert against band extreme, filtered by EMA200 direction.
+        BULL/TREND_LONG: long when price is within 3% below EMA200 or above it.
+          - Price > EMA200: full long
+          - Price within 3% below EMA200: long allowed (recovering/near MA)
+          - Price > 3% below EMA200: no trade (true downtrend)
+        RANGE/MEAN_REVERT: long at lower-band, short at upper-band.
+          EMA200 filter relaxed to 5% band to allow range trading.
         """
         c = df["close"]
         price = float(c.iloc[-1])
         ema200 = float(c.ewm(span=200, adjust=False).mean().iloc[-1])
+        ema_gap = (price - ema200) / ema200  # positive = above, negative = below
         above_ema = price > ema200
+        near_ema = ema_gap >= -0.03  # within 3% below EMA200 counts as long-eligible
 
         if action == "TREND_LONG":
-            return 1 if above_ema else 0
+            # Long if above EMA200 OR within 3% below (pullback/recovery zone)
+            return 1 if near_ema else 0
 
         if action == "MEAN_REVERT":
             ma20 = c.rolling(20).mean().iloc[-1]
             sd20 = c.rolling(20).std().iloc[-1]
             upper = ma20 + 1.5 * sd20
             lower = ma20 - 1.5 * sd20
-            if price > upper and above_ema:
+            # Short at upper band: price extended AND not deep below EMA (i.e. not crashed)
+            if price > upper and ema_gap > -0.05:
                 return -1
-            if price < lower and not above_ema:
+            # Long at lower band: price oversold AND not in extreme downtrend
+            if price < lower and ema_gap > -0.08:
                 return 1
             return 0
         return 0
