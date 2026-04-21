@@ -99,6 +99,7 @@ def main():
     last_equity = 0.0
     last_heartbeat = 0.0
     pending_meta_signal_id = None
+    _tg_cooldowns: dict = {}  # throttle noisy Telegram alerts
 
     while True:
         try:
@@ -177,7 +178,10 @@ def main():
                 if signal.meta_p_win is not None and signal.meta_p_win < 0.35:
                     skip_msg = f"[SKIP] p_win={signal.meta_p_win:.2f} below floor 0.35 — trade blocked"
                     log.warning(skip_msg)
-                    notifier.send(skip_msg)
+                    _tg_now = __import__("time").time()
+                    if _tg_now - _tg_cooldowns.get("skip", 0) >= 600:
+                        _tg_cooldowns["skip"] = _tg_now
+                        notifier.send(skip_msg)
                     continue
                 order = client.place_order(**order_kwargs)
                 pending_meta_signal_id = signal.meta_signal_id
@@ -200,7 +204,10 @@ def main():
                 print(msg)
 
             if signal.regime == "EXTREME_VOL":
-                notifier.send("🚨 Extreme vol — pausing 5m")
+                _tg_now2 = __import__("time").time()
+                if _tg_now2 - _tg_cooldowns.get("extreme_vol", 0) >= 600:
+                    _tg_cooldowns["extreme_vol"] = _tg_now2
+                    notifier.send("🛑 Extreme vol - pausing 5m")
                 time.sleep(300)
                 continue
 
