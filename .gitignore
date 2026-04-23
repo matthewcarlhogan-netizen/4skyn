@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 .env
 /etc/4skyn/
 data/*.json
@@ -8,3 +9,6 @@ __pycache__/
 venv/
 .venv/
 .DS_Store
+=======
+.aider*
+>>>>>>> origin/main

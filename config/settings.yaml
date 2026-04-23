@@ -1,0 +1,98 @@
+capital_tier: seed
+risk:
+  max_drawdown_pct: 0.1
+  risk_per_trade_pct: 0.005
+  max_leverage: 3
+  consecutive_loss_circuit_breaker: 4
+  daily_loss_stop_pct: 0.03
+kelly:
+  fraction_c: 0.25
+  fmax: 0.08
+  prior_mu: 0.002
+  prior_sigma2: 0.0004
+  prior_weight: 30
+  drawdown_clamp_threshold: 0.8
+regime:
+  n_states: 3
+  features:
+  - log_return
+  - realized_vol
+  - trend
+  - volume_zscore
+  - rviv
+  - funding_live
+  - oi_change
+  cov_type: diag
+  confidence_threshold: 0.5
+  training_days: 180
+  retrain_days: 14
+  preserve_learned_transmat: true
+  persistence_bars: 1
+  cooldown_bars: 1
+meta_labeler:
+  enabled: true
+  model_path: models/meta_labeler.pkl
+  activation_threshold: 20
+  prob_threshold: 0.6
+  training_data_path: data/meta_training.parquet
+  retrain_every_n_trades: 25
+  rolling_window_trades: 3000
+regimes:
+  CRISIS:
+    action: HOLD
+  RANGE:
+    action: MEAN_REVERT
+    sl_atr_mult: 1.5
+    tp_atr_mult: 2.0
+  BULL:
+    action: TREND_LONG
+    sl_atr_mult: 1.8
+    tp_atr_mult: 5.0
+ofi:
+  enabled: true
+  use_mainnet_orderbook: true
+  window: 20
+  percentile_threshold: 40
+execution:
+  symbol: BTCUSDT
+  timeframe: '15'
+  closed_bar_only: true
+  min_notional_usd: 100
+  depth_haircut: 0.03
+data:
+  use_mainnet_for_prices: true
+  use_testnet_for_orders: true
+infra:
+  log_dir: logs
+  model_path: models/hmm_btc_v7.pkl
+  trade_log: data/tradelog.json
+  hwm_path: data/highwatermark.json
+  loop_interval_s: 60
+  telegram_heartbeat_s: 3600
+cycle:
+  bybit_symbol: BTCUSDT
+  macro_veto_threshold: -0.9
+meme_scanner:
+  enabled: false
+  interval_minutes: 15
+  alert_threshold: 6
+  lottery_budget_usd: 10.0
+  macro_veto_threshold: -0.9
+cycle_ai:
+  enabled: false
+  checkpoint_path: data/ai_cycle_predictor.pth
+  history_cache_path: data/cycle_history_cache.json
+  seq_len: 60
+  horizon: 30
+hedging:
+  profit_sweep:
+    enabled: false
+    lock_pct: 0.4
+  cash_and_carry:
+    enabled: false
+    allocation_pct: 0.25
+  deribit_tail_puts:
+    enabled: false
+    monthly_premium_pct: 0.01
+    strike_otm_pct: 0.1
+consecutive_loss_circuit_breaker: 3
