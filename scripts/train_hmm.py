@@ -1,0 +1,133 @@
+import os
+import time
+import numpy as np
+import pandas as pd
+import pickle
+from hmmlearn import hmm
+from pybit.unified_trading import HTTP
+import warnings
+warnings.filterwarnings('ignore')
+
+MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models')
+os.makedirs(MODEL_DIR, exist_ok=True)
+MODEL_PATH = os.path.join(MODEL_DIR, 'hmm_btc.pkl')
+
+def fetch_history(symbol='{symbol}', days=365):
+    print(f"Fetching {days} days of 15m klines for {symbol}...")
+    client = HTTP(testnet=False) # Always mainnet for training data
+    all_rows = []
+    end_time = int(time.time() * 1000)
+    target = days * 24 * 4 # 4 x 15m candles per hour
+    
+    while len(all_rows) < target:
+        try:
+            resp = client.get_kline(
+                category='linear',
+                symbol=symbol,
+                interval='15',
+                limit=1000,
+                end=end_time
+            )
+            if resp['retCode'] != 0:
+                print(f"Error: {resp['retMsg']}")
+                break
+            
+            rows = resp['result']['list']
+            if not rows: break
+            
+            all_rows.extend(rows)
+            earliest = int(rows[-1][0])
+            end_time = earliest - 1
+            print(f"Fetched {len(all_rows)}/{target} candles...")
+            time.sleep(0.2) # Avoid rate limits
+        except Exception as e:
+            print(f"Exception: {e}")
+            break
+            
+    df = pd.DataFrame(all_rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = df[col].astype(float)
+    
+    return df.sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
+
+def engineer_features(df):
+    print("Engineering 8 institutional features...")
+    df = df.copy()
+    
+    # 1. Log Returns
+    df['log_return'] = np.log(df['close'] / df['close'].shift(1))
+    
+    # 2. Realized Volatility (20 period)
+    df['realized_vol'] = df['log_return'].rolling(20).std()
+    
+    # 3. Trend
+    df['trend'] = df['close'] / df['close'].rolling(20).mean() - 1
+    
+    # 4. Volume Z-Score
+    vol_mean = df['volume'].rolling(20).mean()
+    vol_std = df['volume'].rolling(20).std()
+    df['volume_zscore'] = (df['volume'] - vol_mean) / (vol_std + 1e-8)
+    
+    # 5. RV / IV Ratio
+    df['rviv'] = df['realized_vol'] / (df['realized_vol'].rolling(100).mean() + 1e-8)
+    
+    df = df.dropna()
+    features = np.column_stack([
+        df['log_return'].values,
+        df['realized_vol'].values,
+        df['trend'].values,
+        df['volume_zscore'].values,
+        df['rviv'].values
+    ])
+    
+    return features, df
+
+def train_and_save():
+    df = fetch_history('{symbol}', days=180) # 6 months for speed/stability
+    if df is None or len(df) < 1000:
+        print("Failed to fetch enough data.")
+        return
+        
+    features, df_clean = engineer_features(df)
+    
+    print(f"Training 3-State GaussianHMM on shape {features.shape}...")
+    model = hmm.GaussianHMM(n_components=3, covariance_type="full", n_iter=100)
+    model.fit(features)
+    
+    print("Sorting states (0=CRISIS, 1=RANGE, 2=BULL)...")
+    means = model.means_[:, 0] # return mean
+    vols = np.sqrt(model.covars_[:, 0, 0]) # return vol
+    
+    # Sort by return / risk ratio. Lowest is crisis, highest is bull
+    order = np.argsort(means / (vols + 1e-8))
+    model.means_ = model.means_[order]
+    model.covars_ = model.covars_[order]
+    
+    # Let EM learn transition dynamics; do not override transmat.
+    
+    # Volatility Check
+    crisis_vol = model.covars_[0,0,0]
+    bull_vol = model.covars_[2,0,0]
+    
+    if bull_vol / (crisis_vol + 1e-8) < 1.2:
+         print(f"Warning: Vol ratio ({bull_vol/crisis_vol:.2f}) weak. State 0 might not be true Crisis.")
+    else:
+         print(f"Vol ratio valid: {bull_vol/crisis_vol:.2f}x")
+
+    # Save
+    bundle = {
+        'model': model,
+        'state_mapping': {0: 'CRISIS', 1: 'RANGE', 2: 'BULL'}
+    }
+    
+    with open(MODEL_PATH, 'wb') as f:
+        pickle.dump(bundle, f)
+        
+    print(f"Model successfully saved to {MODEL_PATH}!")
+    print("OpenClaw V5 will now automatically use the 8-feature HMM.")
+
+def main(symbol: str = "{symbol}"):
+    model_path = f"models/hmm_{symbol.lower().replace('usdt','')}.pkl"
+    print(f"Training HMM for {symbol} → {model_path}")
+    train_and_save()

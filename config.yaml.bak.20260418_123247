@@ -1,0 +1,50 @@
+bybit:
+  api_key: "t5lO38a7sMmUqxdDPG"
+  api_secret: "TfM53ZDZ0a3YaGrIP46qauWB58G0qoYeeL2z"
+  testnet: true
+  symbols: ["BTCUSDT", "ETHUSDT"]
+  leverage: 5
+
+system:
+  dry_run: false
+  loop_interval_seconds: 300
+  dry_run_balance: 1000
+
+risk:
+  risk_per_trade: 0.01          # Institutional fallback (>$10k accounts)
+  daily_loss_limit: -0.05       # -5% equity daily killswitch
+  max_positions: 2
+  cold_start_trades: 50
+  cold_start_days: 14
+  hwm_clamp_ratio: 0.80         # Drawdown clamp: equity < 80% HWM → halve Kelly c
+  depth_haircut_h: 0.03         # Max notional = h * top-5 LOB depth
+  kelly_c_default: 0.25         # Fractional Kelly multiplier
+  kelly_c_min: 0.10             # Minimum c under drawdown clamp
+  kelly_f_max: 0.02             # Hard cap: max Kelly f (2% equity per trade)
+  kelly_window: 100             # Rolling trade window for Kelly estimation
+  ofi_entry_percentile: 50
+  ofi_lookback_bars: 60         # Number of bars for OFI percentile calculation
+
+sharpe:
+  min_trades_for_sharpe: 50
+  gate_threshold: 0.95
+  benchmark_sr: 0.50
+
+hmm:
+  range_confidence_threshold: 0.55
+  covariance_shrinkage_delta: 0.50  # Ledoit-Wolf shrinkage toward diagonal
+
+# ATR multipliers per regime (SL / TP)
+atr:
+  trend_sl_mult: 3.0
+  trend_tp_mult: 6.0
+  range_sl_mult: 1.5
+  range_tp_mult: 2.5
+
+telegram:
+  token: "8667981224:AAE6_1cAh052eLPRUCL-EkE6ok0nDd5svVs"
+  chat_id: "8603772081"
+
+system:
+  shadow_mode: true
+  range_default_sell: false

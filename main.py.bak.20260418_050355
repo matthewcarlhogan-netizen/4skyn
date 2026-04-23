@@ -1,0 +1,375 @@
+"""
+main.py  —  4skyn V7.5
+
+Complete upgrade over V5:
+  1. OFIEngine wired into every signal decision as a 4th vote
+  2. Multi-asset Kelly weights computed per cycle via Ledoit-Wolf covariance
+  3. Regime-gated ATR multipliers (SL/TP from agents_council per regime)
+  4. Liquidity depth haircut on max notional per symbol
+  5. HWM drawdown clamp applied each tick
+  6. Realized PnL (R-multiples) recorded back to RiskEngine on position close
+  7. Telegram: startup, fills, edge-decay, killswitch, regime change alerts
+  8. Weekly async HMM retrain task (sort + enforce + stabilize covars)
+  9. Daily reset with HWM update
+  10. Dual-mode: testnet / mainnet — flip testnet: false + add API keys to go live
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+
+import httpx
+
+# Telegram command state
+bot_paused = False
+import yaml
+
+from agents_council import AgentsCouncil
+from data_fetcher import fetch_ohlcv
+from ofi_engine import OFIEngine
+from order_exec import OrderExecutor
+from regime_hmm import RegimeHMM
+from risk_engine import RiskEngine
+from ws_pybit import BybitWSHandler
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger('main')
+
+
+# ------------------------------------------------------------------
+# Telegram
+# ------------------------------------------------------------------
+async def send_telegram(token: str, chat_id: str, msg: str):
+    if not token or token.startswith('YOUR'):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f'https://api.telegram.org/bot{token}/sendMessage',
+                json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}
+            )
+    except Exception as e:
+        logger.error(f'Telegram failed: {e}')
+
+
+# ------------------------------------------------------------------
+# Weekly HMM retrain background task
+
+# ------------------------------------------------------------------ 
+# Telegram Listener
+# ------------------------------------------------------------------
+last_update_id = 0
+
+async def poll_telegram(token: str, chat_id: str):
+    global last_update_id
+    if not token or token.startswith('YOUR'):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f'https://api.telegram.org/bot{token}/getUpdates',
+                params={'offset': last_update_id + 1, 'timeout': 5}
+            )
+            data = r.json()
+            if data.get('ok') and data.get('result'):
+                for update in data['result']:
+                    last_update_id = update['update_id']
+                    if 'message' in update:
+                        msg = update['message']
+                        if msg.get('chat', {}).get('id') == int(chat_id) and 'text' in msg:
+                            await handle_command(msg['text'], token, chat_id)
+    except Exception as e:
+        pass
+
+async def handle_command(text: str, token: str, chat_id: str):
+    global bot_paused, open_positions
+    cmd = text.strip().lower()
+    
+    if cmd == '/status':
+        bal = executor.get_balance()
+        pos_str = "\n".join([f"{s}: {p['signal']} @ {p['entry']}" for s, p in open_positions.items()]) or "None"
+        msg = f'<b>📊 Status</b>\nBalance: {bal:.2f} USDT\nOpen Positions:\n{pos_str}\nPaused: {bot_paused}'
+        await send_telegram(token, chat_id, msg)
+    
+    elif cmd == '/pause':
+        bot_paused = True
+        await send_telegram(token, chat_id, '⏸️ Bot paused. No new entries.')
+    
+    elif cmd == '/resume':
+        bot_paused = False
+        await send_telegram(token, chat_id, '▶️ Bot resumed.')
+    
+    elif cmd == '/stop':
+        await send_telegram(token, chat_id, '🛑 Stopping bot...')
+        import sys
+        sys.exit(0)
+    
+    elif cmd == '/pnl':
+        bal = executor.get_balance()
+        hwm = risk.high_water_mark
+        pnl = bal - 10000  # Assuming 10k start
+        msg = f'<b>💰 PnL</b>\nBalance: {bal:.2f} USDT\nHWM: {hwm:.2f}\nPnL: {pnl:+.2f} USDT'
+        await send_telegram(token, chat_id, msg)
+    
+    elif cmd == '/regime':
+        btc_state, btc_conf = hmm_model.get_regime('BTCUSDT')
+        eth_state, eth_conf = hmm_model.get_regime('ETHUSDT')
+        msg = f'<b>📈 Regime</b>\nBTCUSDT: {btc_state} ({btc_conf*100:.0f}%)\nETHUSDT: {eth_state} ({eth_conf*100:.0f}%)'
+        await send_telegram(token, chat_id, msg)
+
+# ------------------------------------------------------------------
+async def retrain_hmm_weekly(hmm_model: RegimeHMM, tg_token: str, tg_chat: str):
+    while True:
+        await asyncio.sleep(7 * 24 * 3600)
+        logger.info('Weekly HMM retrain triggered')
+        hmm_model.sort_states()
+        hmm_model.enforce_transmat()
+        hmm_model._stabilize_covars()
+        await send_telegram(tg_token, tg_chat, '🔄 OpenClaw: Weekly HMM retrain complete')
+
+
+# ------------------------------------------------------------------
+# Main loop
+# ------------------------------------------------------------------
+async def main_loop():
+    with open('config.yaml') as f:
+        cfg = yaml.safe_load(f)
+
+    tg_token  = cfg['telegram']['token']
+    tg_chat   = cfg['telegram']['chat_id']
+    symbols   = cfg['bybit']['symbols']
+    dry_run   = cfg['system']['dry_run']
+    interval  = cfg['system']['loop_interval_seconds']
+    conf_gate = cfg['risk'].get('hmm_conf_gate', 0.70)
+    ofi_pct   = cfg['risk'].get('ofi_entry_percentile', 75)
+
+    # --- Instantiate components ---
+    hmm_model = RegimeHMM(
+        shrink_delta=cfg['hmm'].get('covariance_shrinkage_delta', 0.50)
+    )
+    council   = AgentsCouncil()
+    risk      = RiskEngine()
+    executor  = OrderExecutor()
+    ws        = BybitWSHandler(
+        symbols=symbols,
+        testnet=cfg['bybit']['testnet']
+    )
+    ws.connect(
+        api_key    = cfg['bybit']['api_key']    if not dry_run else None,
+        api_secret = cfg['bybit']['api_secret'] if not dry_run else None
+    )
+    ofi = OFIEngine(ws, percentile_threshold=ofi_pct)
+
+    logger.info(
+        f'🟢 4skyn V7.5 Started | dry_run={dry_run} | '
+        f'testnet={cfg["bybit"]["testnet"]} | symbols={symbols}'
+    )
+    await send_telegram(
+        tg_token, tg_chat,
+        f'🟢 <b>4skyn V7.5 Online</b>\nMode: {"DRY RUN" if dry_run else "LIVE"}\n'
+        f'Testnet: {cfg["bybit"]["testnet"]}\nSymbols: {", ".join(symbols)}'
+    )
+
+    asyncio.create_task(retrain_hmm_weekly(hmm_model, tg_token, tg_chat))
+
+    last_day       = datetime.utcnow().date()
+    open_positions = {}  # {symbol: {'signal': str, 'entry': float, 'sl': float, 'tp': float, 'qty': float, 'sl_mult': float}}
+    prev_regimes   = {}
+
+    while True:
+        try:
+            # ---- Daily reset ----
+            today = datetime.utcnow().date()
+            if today != last_day:
+                risk.reset_daily()
+                last_day = today
+                balance  = executor.get_balance()
+                if balance > risk.high_water_mark:
+                    risk.high_water_mark = balance
+                risk.save_state()
+                await send_telegram(tg_token, tg_chat, f'📊 Daily reset | HWM: {risk.high_water_mark:.2f} USDT')
+
+            # ---- Killswitch check ----
+            if risk.daily_pnl < cfg['risk']['daily_loss_limit']:
+                if not risk.killswitch:
+                    risk.killswitch = True
+                    await send_telegram(tg_token, tg_chat, '🚨 <b>KILLSWITCH</b>: Daily DD limit hit. Bot paused.')
+                await asyncio.sleep(60)
+                continue
+
+            # ---- WebSocket fill notifications ----
+            while ws.last_fills:
+                fill = ws.last_fills.pop(0)
+                sym  = fill.get('symbol', '')
+                fill_msg = (
+                    f'⚡️ <b>FILLED</b>\n'
+                    f'{fill["side"]} {fill["qty"]} {sym}\n'
+                    f'Price: {fill["price"]}\n'
+                    f'Fee: {fill["fee"]}'
+                )
+                asyncio.create_task(send_telegram(tg_token, tg_chat, fill_msg))
+
+                # Record realized PnL if we can compute it
+                if sym in open_positions:
+                    pos    = open_positions[sym]
+                    sl_dist = abs(pos['entry'] - pos['sl'])
+                    if sl_dist > 0:
+                        raw_pnl = (fill['price'] - pos['entry']) * fill['qty']
+                        if pos['signal'] == 'SELL':
+                            raw_pnl = -raw_pnl
+                        pnl_r = raw_pnl / (sl_dist * fill['qty'])  # R-multiple
+                        balance_now = executor.get_balance()
+                        risk.record_trade(sym, pnl_r, balance_now)
+                        logger.info(f'[{sym}] Trade closed: R={pnl_r:.3f} | Balance={balance_now:.2f}')
+
+            # ---- Edge decay check ----
+            if not risk.check_edge_decay(window=20):
+                await send_telegram(tg_token, tg_chat, '⚠️ Edge decay detected. Skipping cycle.')
+                await asyncio.sleep(interval)
+                continue
+
+            if not risk.check_sharpe_gate():
+                await send_telegram(tg_token, tg_chat, '⚠️ Sharpe gate failed. Skipping cycle.')
+                await asyncio.sleep(interval)
+                continue
+
+            # ---- Refresh balance & update OFI buckets ----
+            balance = executor.get_balance()
+            ofi.update_all()
+
+            # ---- Multi-asset Kelly weights ----
+            kelly_weights = risk.multi_asset_kelly_weights(symbols)
+            logger.info(f'Kelly weights: {kelly_weights}')
+
+            # ---- Per-symbol signal evaluation ----
+            for symbol in symbols:
+                df = fetch_ohlcv(
+                    symbol=symbol, interval='15', limit=200,
+                    testnet=False  # always fetch from mainnet for real price data
+                )
+                if df is None:
+                    continue
+
+                # --- Regime detection ---
+                regime, conf = hmm_model.predict(df)
+                logger.info(f'[{symbol}] Regime: {regime} (Conf: {conf:.2f})')
+            if bot_paused:
+                logger.info(f'[{symbol}] Bot paused, skipping')
+                continue
+
+                if conf < conf_gate:
+                    logger.info(f'[{symbol}] Regime conf {conf:.2f} below gate {conf_gate} — skip')
+                    continue
+
+                # Regime change alert
+                if prev_regimes.get(symbol) != regime:
+                    await send_telegram(
+                        tg_token, tg_chat,
+                        f'🔄 <b>{symbol}</b> regime: <b>{prev_regimes.get(symbol, "?")} → {regime}</b> (conf {conf:.2f})'
+                    )
+                    prev_regimes[symbol] = regime
+
+                # --- OFI signal ---
+                direction_hint = 'BUY'  # will refine after council vote
+                ofi_signal = ofi.get_signal(symbol, direction_hint)
+                logger.info(
+                    f'[{symbol}] OFI: {ofi_signal["ofi"]:.1f} | '
+                    f'Pct: {ofi_signal["pct"]:.1f} | Aligned: {ofi_signal["aligned"]}'
+                )
+
+                # --- Council signal (regime-aware) ---
+                mid = ws.get_mid_price(symbol) or df['close'].iloc[-1]
+                signal, bull_s, bear_s, reasons, atr, sl_mult, tp_mult = council.get_signal(
+                    df, regime, conf, ofi_signal=ofi_signal
+                )
+
+                # Re-check OFI alignment against actual signal direction
+                if signal != 'HOLD':
+                    ofi_signal = ofi.get_signal(symbol, signal)
+                    if not ofi_signal['aligned']:
+                        logger.info(
+                            f'[{symbol}] {signal} signal blocked: OFI not aligned '
+                            f'(ofi={ofi_signal["ofi"]:.1f}, pct={ofi_signal["pct"]:.1f})'
+                        )
+                        continue  # OFI gate: do not enter without aligned flow
+
+                if signal == 'HOLD':
+                    continue
+
+                # --- Duplicate / reversal check ---
+                if symbol in open_positions:
+                    pos_signal = open_positions[symbol]['signal']
+                    if pos_signal == signal:
+                        logger.info(f'[{symbol}] Already in {signal}. Skip duplicate.')
+                        continue
+                    else:
+                        logger.info(f'[{symbol}] Signal reversed {pos_signal} → {signal}. Closing old position.')
+                        old = open_positions[symbol]
+                        executor.close_position(symbol, 'Buy' if pos_signal == 'BUY' else 'Sell', old['qty'])
+                        del open_positions[symbol]
+
+                # --- Liquidity depth haircut ---
+                depth_usd = ofi.get_top5_depth_usd(symbol)
+
+                # --- Position sizing (full pipeline) ---
+                kelly_w = kelly_weights.get(symbol, 1.0 / len(symbols))
+                qty = risk.position_size(
+                    balance        = balance,
+                    atr            = atr,
+                    price          = mid,
+                    open_positions = len(open_positions),
+                    symbol         = symbol,
+                    regime         = regime,
+                    top5_depth_usd = depth_usd,
+                    kelly_weight   = kelly_w
+                )
+
+                if qty <= 0:
+                    logger.info(f'[{symbol}] qty=0 after sizing — skip')
+                    continue
+
+                # --- Place order ---
+                order = executor.place_order(
+                    symbol   = symbol,
+                    side     = 'Buy' if signal == 'BUY' else 'Sell',
+                    qty      = qty,
+                    price    = mid,
+                    atr      = atr,
+                    sl_mult  = sl_mult,
+                    tp_mult  = tp_mult
+                )
+
+                if order:
+                    open_positions[symbol] = {
+                        'signal':   signal,
+                        'entry':    mid,
+                        'sl':       order['sl'],
+                        'tp':       order['tp'],
+                        'qty':      qty,
+                        'sl_mult':  sl_mult,
+                        'tp_mult':  tp_mult,
+                    }
+                    risk.trades_executed += 1
+                    risk.save_state()
+
+                    order_msg = (
+                        f'🟢 <b>{signal} {symbol}</b>\n'
+                        f'Entry: {mid:.4f} | Qty: {qty}\n'
+                        f'SL: {order["sl"]} (x{sl_mult} ATR) | TP: {order["tp"]} (x{tp_mult} ATR)\n'
+                        f'Regime: {regime} | OFI pct: {ofi_signal["pct"]:.0f}\n'
+                        f'Kelly w: {kelly_w:.3f} | Balance: {balance:.2f} USDT'
+                    )
+                    await send_telegram(tg_token, tg_chat, order_msg)
+
+            await asyncio.sleep(interval)
+
+        except Exception as e:
+            logger.error(f'Loop error: {e}', exc_info=True)
+            await asyncio.sleep(30)
+
+
+if __name__ == '__main__':
+    asyncio.run(main_loop())

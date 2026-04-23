@@ -1,5 +1,10 @@
-config.yaml
-*.pkl
+.env
+/etc/4skyn/
+data/*.json
 logs/
+models/*.pkl
 __pycache__/
+*.pyc
+venv/
+.venv/
 .DS_Store

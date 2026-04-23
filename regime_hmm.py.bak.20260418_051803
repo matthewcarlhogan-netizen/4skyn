@@ -1,0 +1,196 @@
+"""
+regime_hmm.py  —  OpenClaw V6
+
+Upgrades over V5:
+  1. Diagonal covariance HMM (replaces full covariance) — more stable for crypto
+  2. Ledoit-Wolf shrinkage option on emission covariances
+  3. 4 core real-time features (return, vol, trend, vol_z) + 4 stubs
+     upgradeable to live OI/funding/dominance/RVIV when APIs are wired
+  4. Covariance regularization applied after every sort/enforce cycle
+  5. regime_proba() exposes full posterior for downstream use
+"""
+
+import logging
+import pickle
+import warnings
+
+import numpy as np
+import pandas as pd
+from hmmlearn import hmm
+
+warnings.filterwarnings('ignore')
+logger = logging.getLogger(__name__)
+
+
+class RegimeHMM:
+    def __init__(self, model_path='models/hmm_{symbol.lower().replace("usdt","")}.pkl', shrink_delta: float = 0.50):
+        self.model_path  = model_path
+        self.shrink_delta = shrink_delta   # Ledoit-Wolf delta toward diagonal
+        self.model       = None
+        self.state_mapping = {0: 'CRISIS', 1: 'RANGE', 2: 'BULL'}
+        self.load_model()
+
+    # ------------------------------------------------------------------
+    # Model I/O
+    # ------------------------------------------------------------------
+    def load_model(self):
+        try:
+            with open(self.model_path, 'rb') as f:
+                saved = pickle.load(f)
+            self.model         = saved['model']
+            self.state_mapping = saved.get('state_mapping', self.state_mapping)
+            self._stabilize_covars()
+            logger.info(f'HMM loaded: {self.model_path} | states={len(self.state_mapping)} | cov_type={getattr(self.model, "covariance_type", "?")} | n_features={self.model.means_.shape[1]}')
+        except FileNotFoundError:
+            logger.warning(f'HMM model not found at {self.model_path} — run scripts/train_hmm.py')
+
+    def _stabilize_covars(self):
+        """
+        Apply Ledoit-Wolf shrinkage to each regime emission covariance.
+        For diagonal models (diag cov type) this is a no-op.
+        For full covariance models, shrinks toward diagonal.
+        """
+        if self.model is None:
+            return
+        cov_type = getattr(self.model, 'covariance_type', 'full')
+        if cov_type == 'diag':
+            # Add small jitter to prevent zero variances
+            self.model.covars_ = np.clip(self.model.covars_, 1e-8, None)
+            return
+        # Full covariance: shrink each regime covariance toward diagonal
+        delta = self.shrink_delta
+        for k in range(self.model.covars_.shape[0]):
+            Sigma = self.model.covars_[k]
+            F     = np.diag(np.diag(Sigma))
+            self.model.covars_[k] = delta * F + (1 - delta) * Sigma
+            # Add jitter for numerical stability
+            n = Sigma.shape[0]
+            self.model.covars_[k] += np.eye(n) * 1e-8
+
+    # ------------------------------------------------------------------
+    # State management
+    # ------------------------------------------------------------------
+    def sort_states(self):
+        """Sort states by return/risk ratio so CRISIS=0, RANGE=1, BULL=2."""
+        if self.model is None:
+            return
+        means = self.model.means_[:, 0]
+        vols  = self._get_per_state_vol()
+        order = np.argsort(means / (vols + 1e-8))
+        self.model.means_ = self.model.means_[order]
+        cov_type = getattr(self.model, 'covariance_type', 'full')
+        if cov_type == 'diag':
+            self.model.covars_ = self.model.covars_[order]
+        else:
+            self.model.covars_ = self.model.covars_[order]
+        self._stabilize_covars()
+
+    def _get_per_state_vol(self) -> np.ndarray:
+        cov_type = getattr(self.model, 'covariance_type', 'full')
+        if cov_type == 'diag':
+            return np.sqrt(self.model.covars_[:, 0])
+        else:
+            return np.sqrt(self.model.covars_[:, 0, 0])
+
+    def enforce_transmat(self):
+        """Override transition matrix to prevent label drift."""
+        if self.model is None:
+            return
+            [0.92, 0.05, 0.03],   # CRISIS: sticky
+            [0.04, 0.91, 0.05],   # RANGE
+            [0.10, 0.15, 0.75]    # BULL: not as sticky (crypto churns)
+        ])
+
+    # ------------------------------------------------------------------
+    # Feature engineering
+    # ------------------------------------------------------------------
+    def prepare_features(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Engineers HMM feature matrix from OHLCV DataFrame.
+        Returns ndarray shaped (T, n_features).
+        Features 1-4 are always live; 5-8 are stubs (0) until live APIs wired.
+        """
+        if len(df) > 500:
+            df = df.tail(500).copy()
+        else:
+            df = df.copy()
+
+        df['log_return']   = np.log(df['close'] / df['close'].shift(1))
+        df['realized_vol'] = df['log_return'].rolling(20).std()
+        df['trend']        = df['close'] / df['close'].rolling(20).mean() - 1
+        vol_mean           = df['volume'].rolling(20).mean()
+        vol_std            = df['volume'].rolling(20).std()
+        df['volume_zscore'] = (df['volume'] - vol_mean) / (vol_std + 1e-8)
+
+        # RV/IV ratio (realized over its own rolling mean) — fully internal
+        df['rviv'] = df['realized_vol'] / (df['realized_vol'].rolling(100).mean() + 1e-8)
+
+        df = df.dropna()
+        n  = len(df)
+
+        features = np.column_stack([
+            df['log_return'].values,
+            df['realized_vol'].values,
+            df['trend'].values,
+            df['volume_zscore'].values,
+            np.full(n, 0.0001),   # funding8h stub  → swap for live endpoint
+            np.zeros(n),           # oichg20 stub    → CryptoQuant
+            np.zeros(n),           # btcdomz stub    → Glassnode
+            df['rviv'].values,     # RV/IV — live internal feature
+        ])
+        return features
+
+    # ------------------------------------------------------------------
+    # Prediction
+    # ------------------------------------------------------------------
+    def predict(self, df: pd.DataFrame) -> tuple:
+        """
+        Returns (regime_label: str, confidence: float)
+        """
+        if self.model is None:
+            return 'UNKNOWN', 0.0
+
+        features = self.prepare_features(df)
+        n_feat_model = self.model.means_.shape[1]
+
+        # Slice to match model's expected feature count
+        if features.shape[1] > n_feat_model:
+            features = features[:, :n_feat_model]
+
+        try:
+            states     = self.model.predict(features)
+            posteriors = self.model.predict_proba(features)
+            last_state = int(states[-1])
+            conf       = float(posteriors[-1, last_state])
+            label      = self.state_mapping.get(last_state, 'UNKNOWN')
+
+            # Log ingestion line (diagnostic)
+            if features.shape[1] >= 4:
+                latest = features[-1]
+                names  = ['Ret', 'Vol', 'Trnd', 'VolZ', 'Fund', 'OI', 'Dom', 'RV/IV']
+                parts  = [f'{names[i]}:{latest[i]:.4f}' for i in range(len(latest))]
+                logger.info(f'HMM INGESTION -> {" | ".join(parts)}')
+
+            return label, conf
+        except Exception as e:
+            logger.error(f'HMM predict error: {e}')
+            return 'UNKNOWN', 0.0
+
+    def regime_proba(self, df: pd.DataFrame) -> dict:
+        """
+        Returns full posterior probability dict:
+          {'CRISIS': 0.02, 'RANGE': 0.15, 'BULL': 0.83}
+        """
+        if self.model is None:
+            return {v: 1/3 for v in self.state_mapping.values()}
+        features = self.prepare_features(df)
+        n_feat_model = self.model.means_.shape[1]
+        if features.shape[1] > n_feat_model:
+            features = features[:, :n_feat_model]
+        try:
+            posteriors = self.model.predict_proba(features)
+            last_row   = posteriors[-1]
+            return {self.state_mapping.get(i, str(i)): float(last_row[i]) for i in range(len(last_row))}
+        except Exception as e:
+            logger.error(f'regime_proba error: {e}')
+            return {v: 1/3 for v in self.state_mapping.values()}

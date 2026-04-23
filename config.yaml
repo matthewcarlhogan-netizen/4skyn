@@ -1,0 +1,35 @@
+bybit:
+  api_key: "YOUR_TESTNET_KEY_HERE"
+  api_secret: "YOUR_TESTNET_SECRET_HERE"
+  testnet: true
+  leverage: 5
+  symbols: ["BTCUSDT", "ETHUSDT"]
+
+system:
+  dry_run: false
+  shadow_mode: false
+  interval: 300
+  loop_interval_seconds: 300
+
+telegram:
+  token: "8667981224:AAE6_1cAh052eLPRUCL-EkE6ok0nDd5svVs"
+  chat_id: "8603772081"
+
+ofi:
+  ofi_entry_percentile: 50
+
+regime:
+  hmm_conf_gate: 0.55
+  range_confidence_threshold: 0.55
+
+hmm:
+  covariance_shrinkage_delta: 0.50
+
+risk:
+  daily_loss_limit: -0.05
+  max_drawdown: 0.15
+  edge_decay_window: 20
+  kelly_c_min: 0.10
+  risk_per_trade: 0.02
+  cold_start_trades: 30
+  cold_start_days: 7
